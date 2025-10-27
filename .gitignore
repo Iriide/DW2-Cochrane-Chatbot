@@ -1,2 +1,3 @@
-./src/book
-./src/data
+src/book
+src/data
+.venv
