@@ -1,18 +1,14 @@
-import math
-import os
-
 import numpy as np
 import pandas as pd
-from dotenv import load_dotenv
 import re
 from typing import Dict, Any, List
 
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
+import stopwords
 
 UNCERTAIN_WORDS = {'maybe', 'possibly', 'might', 'could', 'not sure', 'uncertain', 'unknown', 'unsure', 'probably'}
-STOPWORDS = {'the', 'a', 'an', 'is', 'are', 'do', 'does', 'to', 'of', 'and', 'or', 'with', 'for', 'in', 'on', 'by',
-             'at', 'from'}
+STOPWORDS = set(stopwords.get_stopwords('en'))
 
 
 def extract_keywords(text: str) -> set:
@@ -69,7 +65,7 @@ def is_low_quality_answer(answer: str, question: str, valid_titles: [], top_scor
     if len(answer_words) < min_tokens:
         low_quality_answer_reason.append('too_short')
         return True, low_quality_answer_reason
-    # if the answer provided by model does not have keywordss from the question
+    # if the answer provided by model does not have keywords from the question
     if not extract_keywords(question).intersection(extract_keywords(answer)):
         low_quality_answer_reason.append('no_keywords')
         return True, low_quality_answer_reason
@@ -81,8 +77,41 @@ def is_low_quality_answer(answer: str, question: str, valid_titles: [], top_scor
         return True, low_quality_answer_reason
     return False, []
 
+def llm_score_answer(answer: str, question: str, model, tokenizer) -> str | None:
+    device = next(model.parameters()).device
+    print(f'Scoring on device: {device}')
+    prompt = f"""
+    You are evaluating an answer to a question.
+    
+    Question:
+    {question}
+    
+    Answer:
+    {answer}
+    
+    Classify the answer into ONE category:
+    - CORRECT
+    - PARTIALLY_CORRECT
+    - INCORRECT
+    - HALLUCINATED
+    - NOT_ANSWERING_QUESTION
+    
+    Respond with ONLY the category name.
+    """
+    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+    with torch.no_grad():
+        output_ids = model.generate(
+            **inputs,
+            max_new_tokens=10,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+    decoded = tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
-def score_answer(answer: str, question: str, valid_titles: [], confidence: float, top_score: float) -> Dict[str, Any]:
+    return decoded
+
+
+def score_answer(answer: str, question: str, valid_titles: [], top_score: float, model, tokenizer) -> Dict[str, Any]:
     answer_clean = answer.strip().lower()
     answer_words = extract_keywords(answer_clean)
     question_keywords = extract_keywords(question)
@@ -93,17 +122,16 @@ def score_answer(answer: str, question: str, valid_titles: [], confidence: float
     # this is calculated +2 for kewords matching || +1 for length (capped at 30) || -2 for uncertain words
     score = keyword_matches * 2 + min(length, 30) - uncertain_count * 2
 
-    if confidence is not None:
-        score += int(confidence * 10)
+    llm_score = llm_score_answer(answer, question, model, tokenizer)
 
     return {
         'score': score,
         'keyword_matches': keyword_matches,
         'length': length,
         'uncertain_count': uncertain_count,
-        'confidence': confidence,
         'is_low_quality': is_low_quality_answer(answer, question, valid_titles, top_score)[0],
         'low_quality_answer_reason': is_low_quality_answer(answer, question, valid_titles, top_score)[1],
+        'llm_score': llm_score,
     }
 
 def compute_overlap_percentage(answer: str, sources: List[str]) -> float:
@@ -135,8 +163,9 @@ def compute_trust_score(answer: str, sources: List[str], embed_fn) -> Dict[str, 
 class RAGModel:
     def __init__(
         self,
-        GENERATION_MODEL: str = "allenai/OLMo-2-0425-1B-Instruct",
+        GENERATION_MODEL: str = "allenai/Olmo-3-7B-Instruct",
         EMBEDDING_MODEL: str = "BAAI/bge-large-en-v1.5",
+        VALIDATION_MODEL: str = "google/gemma-3-1b-it",
         DEVICE: str = None,
         read_from_file: bool = True,
     ):
@@ -147,7 +176,6 @@ class RAGModel:
         self.DEVICE = DEVICE
         print(f"Using device: {self.DEVICE}")
 
-        # ===== 1) Load EMBEDDING MODEL =====
         self.EMB_TOKENIZER = AutoTokenizer.from_pretrained(EMBEDDING_MODEL)
         self.EMB_MODEL = AutoModel.from_pretrained(EMBEDDING_MODEL).to(self.DEVICE).eval()
 
@@ -156,16 +184,36 @@ class RAGModel:
         self.EMBEDDING_MODEL = EMBEDDING_MODEL
 
 
-        # load model + tokenizer
         self.TOKENIZER = AutoTokenizer.from_pretrained(self.GENERATION_MODEL, trust_remote_code=True)
-        # for some causal LMs you may need a pad token
         if self.TOKENIZER.pad_token is None:
             self.TOKENIZER.pad_token = self.TOKENIZER.eos_token
 
-        self.OLMO_MODEL = AutoModelForCausalLM.from_pretrained(
-            self.GENERATION_MODEL
-        ).to(self.DEVICE).eval()
-        print(f"Loaded model: {self.GENERATION_MODEL}")
+        self.OLMO_MODEL = (
+            AutoModelForCausalLM.from_pretrained(
+                "allenai/Olmo-3-7B-Instruct",
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True
+            )
+            .to(self.DEVICE)
+            .eval()
+        )
+
+        self.VALIDATION_TOKENIZER = AutoTokenizer.from_pretrained(
+            VALIDATION_MODEL,
+            trust_remote_code=True
+        )
+        self.VALIDATION_MODEL = (
+            AutoModelForCausalLM.from_pretrained(
+                VALIDATION_MODEL,
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True
+            )
+            .to(self.DEVICE)
+            .eval()
+        )
+
+        first_param_device = next(self.OLMO_MODEL.parameters()).device
+        print(f"Loaded model: {self.GENERATION_MODEL} on {first_param_device}")
 
         # load paragraphs
         self.df = pd.read_csv("src/data/all_postprocessed_paragraphs.csv")
@@ -183,12 +231,11 @@ class RAGModel:
             self.df = pd.read_pickle("embeddings.pkl")
             print("Loaded embeddings from embeddings.pkl.")
 
-    # ---------- Embeddings using EMB_MODEL ----------
     def _embed_text(self, text: str, max_length: int = 1024) -> np.ndarray:
         """Turn text into a single embedding vector using EMB_MODEL hidden states (mean pooling)."""
 
         max_len = int(getattr(self.EMB_MODEL.config, "max_position_embeddings", max_length))
-        max_len = min(max_len, max_length)  # safety, but usually already 512
+        max_len = min(max_len, max_length)
 
         inputs = self.EMB_TOKENIZER(
             text,
@@ -211,7 +258,6 @@ class RAGModel:
     def embed_query(self, query: str) -> np.ndarray:
         return self._embed_text(query)
 
-    # ---------- Token stats ----------
 
     def get_tokens_used(self, text: str) -> Dict[str, float]:
         words = text.split()
@@ -226,20 +272,16 @@ class RAGModel:
 
     # ---------- RAG query ----------
 
-    def ask(self, query: str):
+    def ask(self, query: str, answer: str = None) -> Any:
         """Generate a response to the query using OLMO, with retrieval + scoring."""
 
-        # 1. Get embedding for the query (OLMO instead of genai.embed_content)
         question_embedding = self.embed_query(query)  # shape (d,)
         print(question_embedding.shape)
 
-        # 2. Compute similarity with document embeddings
-        # Ensure Embedding column contains numpy arrays or lists of same length
         doc_embeddings = np.stack(self.df["Embedding"].to_list())  # (n_docs, d)
         dot_products = np.dot(doc_embeddings, question_embedding)  # (n_docs,)
         sorted_indices = np.argsort(dot_products)[::-1]
 
-        # 2a. Similarity drop detection (Delta Cutoff)
         delta_cutoff_ratio = 0.95  # Allow 5% drop from top score
         top_score = float(dot_products[sorted_indices[0]])
         print(top_score)
@@ -252,15 +294,12 @@ class RAGModel:
             top_indices.append(idx)
 
         top_indices = top_indices[:5]
-        # assumes you have columns 'Title' and 'Content' in df for display
         top_passages_info = self.df.iloc[top_indices][["section", "paragraph"]]
 
-        # 3. Format passages with metadata (section title)
         formatted_passages = [
             f"({row.section}) {row.paragraph}" for _, row in top_passages_info.iterrows()
         ]
 
-        # 4. Prepare prompts
         PROMPT = f"""You are a helpful and informative bot that answers questions using the reference passages below.
 Use only the relevant information, and always cite the section title when answering (e.g., "According to Chapter..."). If the answer is not contained within the passages, do not assist with that question.
 
@@ -269,7 +308,7 @@ QUESTION: {query}
 PASSAGES:
 {chr(10).join(f'- {p}' for p in formatted_passages)}
 
-ANSWER:"""
+"""
 
         PROMPT_SIMPLIFIED = f"""You are a helpful and informative bot that answers questions using the reference passages below.
 Cite section titles in your answer for transparency.
@@ -279,9 +318,8 @@ QUESTION: {query}
 PASSAGES:
 {chr(10).join(f'- {row.section}' for _, row in top_passages_info.iterrows())}
 
-ANSWER:"""
+"""
 
-        # 5. Generate answer from OLMO
         inputs = self.TOKENIZER(
             PROMPT,
             return_tensors="pt",
@@ -301,36 +339,33 @@ ANSWER:"""
 
         decoded = self.TOKENIZER.decode(output_ids[0], skip_special_tokens=True)
 
-        # Extract only the completion part after PROMPT if it's included
         if decoded.startswith(PROMPT):
             answer_text = decoded[len(PROMPT):].strip()
         else:
             answer_text = decoded.strip()
 
-        # No log-probabilities from plain generate; set confidence to None
-        confidence = None
+        if answer is not None:
+            answer = answer
 
         custom_tokens_used = self.get_tokens_used(PROMPT + answer_text)
 
-        # Crude estimate of tokens used (input + output) using tokenizer
         input_ids = inputs["input_ids"]
         total_input_tokens = int(input_ids.numel())
         total_output_tokens = int(output_ids.shape[1])
-        tokens_used = total_output_tokens  # or total_input_tokens + (total_output_tokens - total_input_tokens)
+        tokens_used = total_output_tokens
 
-        # 6. Quality scoring and trust scoring
         quality = score_answer(
             answer_text,
-            query,
+            answer,
             self.df["section"].tolist(),
-            confidence,
             top_score,
+            self.VALIDATION_MODEL,
+            self.VALIDATION_TOKENIZER
         )
 
         source_texts = top_passages_info["paragraph"].tolist()
         trust = compute_trust_score(answer_text, source_texts, self.embed_document)
 
-        # 7. Metadata for UI highlighting
         used_chunks = [
             {"section": row.section, "content": row.paragraph}
             for _, row in top_passages_info.iterrows()

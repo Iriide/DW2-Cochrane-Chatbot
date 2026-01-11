@@ -1,3 +1,5 @@
 src/book
 src/data
 .venv
+src/.env
+embeddings.pkl
