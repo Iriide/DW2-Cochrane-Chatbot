@@ -83,14 +83,14 @@ import torch
 
 VALID = {"CORRECT", "INCORRECT", "NOT_ANSWERING_QUESTION"}
 
-def llm_score_answer(question: str, model_answer: str, true_answer: str, model, tokenizer) -> str | None:
+
+def llm_score_answer(model_answer: str, true_answer: str, model, tokenizer) -> str | None:
     device = next(model.parameters()).device
 
     prompt = (
         "You are a strict grader.\n"
         "Decide whether the MODEL ANSWER correctly answers the QUESTION, "
         "using the TRUE ANSWER as reference.\n\n"
-        f"QUESTION:\n{question}\n\n"
         f"MODEL ANSWER:\n{model_answer}\n\n"
         f"TRUE ANSWER:\n{true_answer}\n\n"
         "Return exactly one label:\n"
@@ -127,6 +127,7 @@ def llm_score_answer(question: str, model_answer: str, true_answer: str, model, 
         if v in text:
             return v
     return None
+
 
 def score_answer(answer: str, true_answer: str, valid_titles: [], top_score: float, model, tokenizer) -> Dict[str, Any]:
     if not true_answer:
@@ -366,6 +367,15 @@ ANSWER:"""
             max_length=2048,
         ).to(self.DEVICE)
 
+        print("prompt chars:", len(PROMPT))
+        print("prompt tokens:", inputs["input_ids"].shape[1])
+
+        tail = self.TOKENIZER.decode(
+            inputs["input_ids"][0][-200:],
+            skip_special_tokens=False
+        )
+
+        # --- generate ---
         with torch.no_grad():
             output_ids = self.OLMO_MODEL.generate(
                 **inputs,
@@ -373,26 +383,25 @@ ANSWER:"""
                 do_sample=True,
                 temperature=0.7,
                 top_p=0.9,
+                pad_token_id=self.TOKENIZER.pad_token_id,
                 eos_token_id=self.TOKENIZER.eos_token_id,
-                pad_token_id=self.TOKENIZER.pad_token_id or self.TOKENIZER.eos_token_id,
             )
 
-        decoded = self.TOKENIZER.decode(output_ids[0], skip_special_tokens=True)
+        # --- decode ONLY newly generated tokens ---
+        prompt_len = inputs["input_ids"].shape[1]
+        gen_ids = output_ids[0, prompt_len:]
+        answer_text = self.TOKENIZER.decode(gen_ids, skip_special_tokens=True).strip()
 
-        if decoded.startswith(PROMPT):
-            answer_text = decoded[len(PROMPT):].strip().replace("assistant", "")
-        else:
-            answer_text = decoded.strip().replace("assistant", "")
+        # optional cleanup for some chat/instruct models
+        lower = answer_text.lower()
+        if lower.startswith("assistant"):
+            answer_text = answer_text[len("assistant"):].strip()
+        if answer_text.lower().startswith("response:"):
+            answer_text = answer_text[len("response:"):].strip()
 
-        inputs = self.TOKENIZER(PROMPT, return_tensors="pt", truncation=True, max_length=2048)
-        print("prompt chars:", len(PROMPT))
-        print("prompt tokens:", inputs["input_ids"].shape[1])
-
-        # check what the model actually sees at the end
-        tail = self.TOKENIZER.decode(inputs["input_ids"][0][-200:], skip_special_tokens=False)
+        print("ANSWER_TEXT:\n", answer_text)
 
         custom_tokens_used = self.get_tokens_used(PROMPT + answer_text)
-
         total_output_tokens = int(output_ids.shape[1])
         tokens_used = total_output_tokens
 
