@@ -1,12 +1,13 @@
 import streamlit as st
-from src.RAGmodel import RAGModel
+from src.RAGmodel import RAGModelSingleton
 import pandas as pd
 
-def run_queries(all_queries, answers, model):
 
+def run_queries(all_queries, answers):
     for i, query in enumerate(all_queries, 1):
         with st.expander(f"Query {i}: {query}", expanded=False):
-            response, simplified_prompt, used_chunks, tokens_used, custom_tokens_used, quality, trust = model.ask(query, answer=answers[i-1] if i <= len(answers) else None)
+            response, simplified_prompt, used_chunks, tokens_used, custom_tokens_used, quality, trust = RAGModelSingleton().get_instance().ask(
+                query, true_answer=answers[i - 1] if i <= len(answers) else None)
             print(f"Quality: {quality}")
             st.markdown(f"**Response:**\n\n{response}")
             st.markdown(f"**Simplified Prompt:**\n\n```{simplified_prompt}```")
@@ -38,7 +39,6 @@ def main():
 
     queries = [item["question"] for item in data]
     answers = [item["answer"] for item in data]
-    model = RAGModel()
 
     st.set_page_config(page_title="RAGModel UI", layout="wide")
     st.title("🎓 Cochrane Handbook Assistant")
@@ -47,7 +47,7 @@ def main():
         st.session_state.ask_custom = False
 
     if st.button("Run RAGModel on All Queries"):
-        run_queries(queries, answers, model)
+        run_queries(queries, answers)
 
     if st.button("Ask a Custom Query"):
         st.session_state.ask_custom = True
@@ -55,10 +55,11 @@ def main():
     if st.session_state.ask_custom:
         custom_query = st.text_input("Enter your query:")
         if custom_query:
-            run_queries([custom_query], [], model)
+            run_queries([custom_query], [])
     else:
         st.info(
             f"Click one of the buttons above to run the model on {len(queries)} common queries or ask your own")
+
 
 if __name__ == "__main__":
     main()

@@ -46,7 +46,8 @@ def has_invalid_sections(text: str, valid_titles: list[str]) -> bool:
     return bool(cited_numbers - valid_numbers)
 
 
-def is_low_quality_answer(answer: str, question: str, valid_titles: [], top_score: float, min_tokens: int = 15) -> (bool, dict):
+def is_low_quality_answer(answer: str, question: str, valid_titles: [], top_score: float, min_tokens: int = 15) -> (
+        bool, dict):
     low_quality_answer_reason = []
     answer_words = answer.strip().split()
     # well if it's empty
@@ -77,44 +78,70 @@ def is_low_quality_answer(answer: str, question: str, valid_titles: [], top_scor
         return True, low_quality_answer_reason
     return False, []
 
-def llm_score_answer(answer: str, question: str, model, tokenizer) -> str | None:
+
+import torch
+
+VALID = {"CORRECT", "INCORRECT", "NOT_ANSWERING_QUESTION"}
+
+def llm_score_answer(question: str, model_answer: str, true_answer: str, model, tokenizer) -> str | None:
     device = next(model.parameters()).device
-    print(f'Scoring on device: {device}')
-    prompt = f"""
-    You are evaluating an answer to a question.
-    
-    Question:
-    {question}
-    
-    Answer:
-    {answer}
-    
-    Classify the answer into ONE category:
-    - CORRECT
-    - PARTIALLY_CORRECT
-    - INCORRECT
-    - HALLUCINATED
-    - NOT_ANSWERING_QUESTION
-    
-    Respond with ONLY the category name.
-    """
-    inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+    prompt = (
+        "You are a strict grader.\n"
+        "Decide whether the MODEL ANSWER correctly answers the QUESTION, "
+        "using the TRUE ANSWER as reference.\n\n"
+        f"QUESTION:\n{question}\n\n"
+        f"MODEL ANSWER:\n{model_answer}\n\n"
+        f"TRUE ANSWER:\n{true_answer}\n\n"
+        "Return exactly one label:\n"
+        "CORRECT\n"
+        "INCORRECT\n"
+        "NOT_ANSWERING_QUESTION\n"
+        "Label:"
+    )
+
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+
     with torch.no_grad():
-        output_ids = model.generate(
+        out = model.generate(
             **inputs,
-            max_new_tokens=10,
+            max_new_tokens=4,
             do_sample=False,
+            temperature=0.0,
             pad_token_id=tokenizer.eos_token_id,
+            eos_token_id=tokenizer.eos_token_id,
         )
-    decoded = tokenizer.decode(output_ids[0], skip_special_tokens=True)
 
-    return decoded
+    # decode only new tokens
+    gen_ids = out[0, inputs["input_ids"].shape[1]:]
+    text = tokenizer.decode(gen_ids, skip_special_tokens=True).strip().upper()
 
+    # take first “word”
+    label = text.split()[0] if text else None
 
-def score_answer(answer: str, question: str, valid_titles: [], top_score: float, model, tokenizer) -> Dict[str, Any]:
+    if label in VALID:
+        return label
+
+    # fallback: search any valid label inside output
+    for v in VALID:
+        if v in text:
+            return v
+    return None
+
+def score_answer(answer: str, true_answer: str, valid_titles: [], top_score: float, model, tokenizer) -> Dict[str, Any]:
+    if not true_answer:
+        return {
+            'score': 0,
+            'keyword_matches': 0,
+            'length': 0,
+            'uncertain_count': 0,
+            'is_low_quality': False,
+            'low_quality_answer_reason': [],
+            'llm_score': None,
+        }
     answer_clean = answer.strip().lower()
     answer_words = extract_keywords(answer_clean)
-    question_keywords = extract_keywords(question)
+    question_keywords = extract_keywords(true_answer)
 
     keyword_matches = len(question_keywords & answer_words)
     length = len(answer_clean.split())
@@ -122,17 +149,18 @@ def score_answer(answer: str, question: str, valid_titles: [], top_score: float,
     # this is calculated +2 for kewords matching || +1 for length (capped at 30) || -2 for uncertain words
     score = keyword_matches * 2 + min(length, 30) - uncertain_count * 2
 
-    llm_score = llm_score_answer(answer, question, model, tokenizer)
+    llm_score = llm_score_answer(answer, true_answer, model, tokenizer)
 
     return {
         'score': score,
         'keyword_matches': keyword_matches,
         'length': length,
         'uncertain_count': uncertain_count,
-        'is_low_quality': is_low_quality_answer(answer, question, valid_titles, top_score)[0],
-        'low_quality_answer_reason': is_low_quality_answer(answer, question, valid_titles, top_score)[1],
+        'is_low_quality': is_low_quality_answer(answer, true_answer, valid_titles, top_score)[0],
+        'low_quality_answer_reason': is_low_quality_answer(answer, true_answer, valid_titles, top_score)[1],
         'llm_score': llm_score,
     }
+
 
 def compute_overlap_percentage(answer: str, sources: List[str]) -> float:
     answer_tokens = set(re.findall(r'\w+', answer.lower()))
@@ -145,11 +173,13 @@ def compute_overlap_percentage(answer: str, sources: List[str]) -> float:
     overlap = answer_tokens & source_tokens
     return len(overlap) / len(answer_tokens)
 
+
 def compute_similarity_with_sources(answer: str, sources: List[str], embed_fn) -> float:
     answer_embedding = embed_fn("Answer", answer)
     source_embeddings = [embed_fn("Source", s) for s in sources]
     dot_scores = [np.dot(answer_embedding, emb) for emb in source_embeddings]
     return float(np.mean(dot_scores)) if dot_scores else 0.0
+
 
 def compute_trust_score(answer: str, sources: List[str], embed_fn) -> Dict[str, float]:
     overlap_pct = compute_overlap_percentage(answer, sources)
@@ -160,20 +190,31 @@ def compute_trust_score(answer: str, sources: List[str], embed_fn) -> Dict[str, 
         "chunks_used": len(sources)
     }
 
-class RAGModel:
-    def __init__(
-        self,
-        GENERATION_MODEL: str = "allenai/Olmo-3-7B-Instruct",
-        EMBEDDING_MODEL: str = "BAAI/bge-large-en-v1.5",
-        VALIDATION_MODEL: str = "google/gemma-3-1b-it",
-        DEVICE: str = None,
-        read_from_file: bool = True,
-    ):
 
-        # device
+class RAGModelSingleton:
+    _instance = None
+
+    @staticmethod
+    def get_instance(*args, **kwargs):
+        if RAGModelSingleton._instance is None:
+            RAGModelSingleton._instance = RAGModel(*args, **kwargs)
+        return RAGModelSingleton._instance
+
+
+class RAGModel:
+
+    def __init__(
+            self,
+            GENERATION_MODEL: str = "allenai/Olmo-3-7B-Instruct",
+            EMBEDDING_MODEL: str = "BAAI/bge-large-en-v1.5",
+            VALIDATION_MODEL: str = "google/gemma-3-1b-it",
+            DEVICE: str = None,
+            read_from_file: bool = True,
+    ):
         if DEVICE is None:
             DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
         self.DEVICE = DEVICE
+
         print(f"Using device: {self.DEVICE}")
 
         self.EMB_TOKENIZER = AutoTokenizer.from_pretrained(EMBEDDING_MODEL)
@@ -183,14 +224,13 @@ class RAGModel:
         self.READ_FROM_FILE = read_from_file
         self.EMBEDDING_MODEL = EMBEDDING_MODEL
 
-
         self.TOKENIZER = AutoTokenizer.from_pretrained(self.GENERATION_MODEL, trust_remote_code=True)
         if self.TOKENIZER.pad_token is None:
             self.TOKENIZER.pad_token = self.TOKENIZER.eos_token
 
         self.OLMO_MODEL = (
             AutoModelForCausalLM.from_pretrained(
-                "allenai/Olmo-3-7B-Instruct",
+                self.GENERATION_MODEL,
                 torch_dtype=torch.bfloat16,
                 low_cpu_mem_usage=True
             )
@@ -258,7 +298,6 @@ class RAGModel:
     def embed_query(self, query: str) -> np.ndarray:
         return self._embed_text(query)
 
-
     def get_tokens_used(self, text: str) -> Dict[str, float]:
         words = text.split()
         word_count = len(words)
@@ -272,7 +311,7 @@ class RAGModel:
 
     # ---------- RAG query ----------
 
-    def ask(self, query: str, answer: str = None) -> Any:
+    def ask(self, query: str, true_answer: str = None) -> Any:
         """Generate a response to the query using OLMO, with retrieval + scoring."""
 
         question_embedding = self.embed_query(query)  # shape (d,)
@@ -308,7 +347,7 @@ QUESTION: {query}
 PASSAGES:
 {chr(10).join(f'- {p}' for p in formatted_passages)}
 
-"""
+ANSWER:"""
 
         PROMPT_SIMPLIFIED = f"""You are a helpful and informative bot that answers questions using the reference passages below.
 Cite section titles in your answer for transparency.
@@ -318,7 +357,7 @@ QUESTION: {query}
 PASSAGES:
 {chr(10).join(f'- {row.section}' for _, row in top_passages_info.iterrows())}
 
-"""
+ANSWER:"""
 
         inputs = self.TOKENIZER(
             PROMPT,
@@ -334,29 +373,32 @@ PASSAGES:
                 do_sample=True,
                 temperature=0.7,
                 top_p=0.9,
-                pad_token_id=self.TOKENIZER.pad_token_id,
+                eos_token_id=self.TOKENIZER.eos_token_id,
+                pad_token_id=self.TOKENIZER.pad_token_id or self.TOKENIZER.eos_token_id,
             )
 
         decoded = self.TOKENIZER.decode(output_ids[0], skip_special_tokens=True)
 
         if decoded.startswith(PROMPT):
-            answer_text = decoded[len(PROMPT):].strip()
+            answer_text = decoded[len(PROMPT):].strip().replace("assistant", "")
         else:
-            answer_text = decoded.strip()
+            answer_text = decoded.strip().replace("assistant", "")
 
-        if answer is not None:
-            answer = answer
+        inputs = self.TOKENIZER(PROMPT, return_tensors="pt", truncation=True, max_length=2048)
+        print("prompt chars:", len(PROMPT))
+        print("prompt tokens:", inputs["input_ids"].shape[1])
+
+        # check what the model actually sees at the end
+        tail = self.TOKENIZER.decode(inputs["input_ids"][0][-200:], skip_special_tokens=False)
 
         custom_tokens_used = self.get_tokens_used(PROMPT + answer_text)
 
-        input_ids = inputs["input_ids"]
-        total_input_tokens = int(input_ids.numel())
         total_output_tokens = int(output_ids.shape[1])
         tokens_used = total_output_tokens
 
         quality = score_answer(
             answer_text,
-            answer,
+            true_answer,
             self.df["section"].tolist(),
             top_score,
             self.VALIDATION_MODEL,
