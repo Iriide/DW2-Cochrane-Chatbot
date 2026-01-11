@@ -316,7 +316,6 @@ class RAGModel:
         """Generate a response to the query using OLMO, with retrieval + scoring."""
 
         question_embedding = self.embed_query(query)  # shape (d,)
-        print(question_embedding.shape)
 
         doc_embeddings = np.stack(self.df["Embedding"].to_list())  # (n_docs, d)
         dot_products = np.dot(doc_embeddings, question_embedding)  # (n_docs,)
@@ -324,7 +323,6 @@ class RAGModel:
 
         delta_cutoff_ratio = 0.95  # Allow 5% drop from top score
         top_score = float(dot_products[sorted_indices[0]])
-        print(top_score)
 
         top_indices = []
         for idx in sorted_indices:
@@ -387,17 +385,13 @@ ANSWER:"""
                 eos_token_id=self.TOKENIZER.eos_token_id,
             )
 
-        # --- decode ONLY newly generated tokens ---
-        prompt_len = inputs["input_ids"].shape[1]
-        gen_ids = output_ids[0, prompt_len:]
-        answer_text = self.TOKENIZER.decode(gen_ids, skip_special_tokens=True).strip()
+        decoded = self.TOKENIZER.decode(output_ids[0], skip_special_tokens=True)
+        print("FULL OUTPUT:\n", decoded)
 
-        # optional cleanup for some chat/instruct models
-        lower = answer_text.lower()
-        if lower.startswith("assistant"):
-            answer_text = answer_text[len("assistant"):].strip()
-        if answer_text.lower().startswith("response:"):
-            answer_text = answer_text[len("response:"):].strip()
+        if decoded.startswith(PROMPT):
+            answer_text = decoded[len(PROMPT):].strip().replace('assistant', '')
+        else:
+            answer_text = decoded.strip().replace('assistant', '')
 
         print("ANSWER_TEXT:\n", answer_text)
 
