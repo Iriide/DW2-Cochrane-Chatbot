@@ -2,10 +2,9 @@ import numpy as np
 import pandas as pd
 import re
 from typing import Dict, Any, List
-
-import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, AutoModel
 import stopwords
+import torch
 
 UNCERTAIN_WORDS = {'maybe', 'possibly', 'might', 'could', 'not sure', 'uncertain', 'unknown', 'unsure', 'probably'}
 STOPWORDS = set(stopwords.get_stopwords('en'))
@@ -78,19 +77,21 @@ def is_low_quality_answer(answer: str, question: str, valid_titles: [], top_scor
         return True, low_quality_answer_reason
     return False, []
 
-
-import torch
-
 VALID = {"CORRECT", "INCORRECT", "NOT_ANSWERING_QUESTION"}
 
-
-def llm_score_answer(model_answer: str, true_answer: str, model, tokenizer) -> str | None:
+def llm_score_answer(model_answer: str, true_answer: str, query, formatted_passages, model, tokenizer) -> str | None:
     device = next(model.parameters()).device
 
     prompt = (
         "You are a strict grader.\n"
-        "Decide whether the MODEL ANSWER correctly answers the QUESTION, "
-        "using the TRUE ANSWER as reference.\n\n"
+        "You will grade whether the MODEL ANSWER is correct AND faithful to the provided PASSAGES.\n"
+        "Rules:\n"
+        "1) The MODEL ANSWER must match the TRUE ANSWER in meaning.\n"
+        "3) The MODEL ANSWER must cite a section title that appears in PASSAGES.\n"
+        "If PASSAGES do not contain enough info, the only acceptable output is exactly:\n"
+        "Not enough information in the provided passages.\n\n"
+        f"QUESTION:\n{query}\n\n"
+        f"PASSAGES:\n{chr(10).join(f'- {p}' for p in formatted_passages)}\n\n"
         f"MODEL ANSWER:\n{model_answer}\n\n"
         f"TRUE ANSWER:\n{true_answer}\n\n"
         "Return exactly one label:\n"
@@ -129,7 +130,7 @@ def llm_score_answer(model_answer: str, true_answer: str, model, tokenizer) -> s
     return None
 
 
-def score_answer(answer: str, true_answer: str, valid_titles: [], top_score: float, model, tokenizer) -> Dict[str, Any]:
+def score_answer(answer: str, true_answer: str, query, formatted_passages, valid_titles: [], top_score: float, model, tokenizer) -> Dict[str, Any]:
     if not true_answer:
         return {
             'score': 0,
@@ -150,7 +151,7 @@ def score_answer(answer: str, true_answer: str, valid_titles: [], top_score: flo
     # this is calculated +2 for kewords matching || +1 for length (capped at 30) || -2 for uncertain words
     score = keyword_matches * 2 + min(length, 30) - uncertain_count * 2
 
-    llm_score = llm_score_answer(answer, true_answer, model, tokenizer)
+    llm_score = llm_score_answer(answer, true_answer, query, formatted_passages, model, tokenizer)
 
     return {
         'score': score,
@@ -208,7 +209,7 @@ class RAGModel:
             self,
             GENERATION_MODEL: str = "allenai/Olmo-3-7B-Instruct",
             EMBEDDING_MODEL: str = "BAAI/bge-large-en-v1.5",
-            VALIDATION_MODEL: str = "google/gemma-3-1b-it",
+            VALIDATION_MODEL: str = "google/gemma-3-4b-it",
             DEVICE: str = None,
             read_from_file: bool = True,
     ):
@@ -341,12 +342,11 @@ class RAGModel:
         PROMPT = f"""You are a helpful and informative bot that answers questions using the reference passages below.
 Use only the relevant information, and always cite the section title when answering (e.g., "According to Chapter..."). If the answer is not contained within the passages, do not assist with that question.
 
-QUESTION: {query}
+        QUESTION: {query}
 
-PASSAGES:
-{chr(10).join(f'- {p}' for p in formatted_passages)}
-
-ANSWER:"""
+        PASSAGES:
+        {chr(10).join(f'- {p}' for p in formatted_passages)}
+        """
 
         PROMPT_SIMPLIFIED = f"""You are a helpful and informative bot that answers questions using the reference passages below.
 Cite section titles in your answer for transparency.
@@ -402,6 +402,8 @@ ANSWER:"""
         quality = score_answer(
             answer_text,
             true_answer,
+            query,
+            formatted_passages,
             self.df["section"].tolist(),
             top_score,
             self.VALIDATION_MODEL,
