@@ -346,6 +346,7 @@ Use only the relevant information, and always cite the section title when answer
 
         PASSAGES:
         {chr(10).join(f'- {p}' for p in formatted_passages)}
+        ANSWER:
         """
 
         PROMPT_SIMPLIFIED = f"""You are a helpful and informative bot that answers questions using the reference passages below.
@@ -386,14 +387,11 @@ ANSWER:"""
             )
 
         decoded = self.TOKENIZER.decode(output_ids[0], skip_special_tokens=True)
-        print("FULL OUTPUT:\n", decoded)
 
         if decoded.startswith(PROMPT):
             answer_text = decoded[len(PROMPT):].strip().replace('assistant', '')
         else:
             answer_text = decoded.strip().replace('assistant', '')
-
-        print("ANSWER_TEXT:\n", answer_text)
 
         custom_tokens_used = self.get_tokens_used(PROMPT + answer_text)
         total_output_tokens = int(output_ids.shape[1])
